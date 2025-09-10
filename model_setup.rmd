@@ -25,7 +25,7 @@ data$species <- gsub(" ", "_", data$species)
 # -------------------------------
 species_traits <- read.csv("C:/Users/Goswamilab/Desktop/Species_traits_sutures.csv",
                                stringsAsFactors = FALSE)
-species_traits$species <- gsub(" ", "_", species_traitss$species)
+species_traits$species <- gsub(" ", "_", species_traits$species)
 
 # -------------------------------
 # Normalize species names
