@@ -1,0 +1,2114 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+This is an [R Markdown](http://rmarkdown.rstudio.com) Notebook. When you execute code within the notebook, the results appear beneath the code. 
+
+Try executing this chunk by clicking the *Run* button within the chunk or by placing your cursor inside it and pressing *Ctrl+Shift+Enter*. 
+
+
+>snippet 1: we prepare the dataset by loading and pruning the phylogeny, loading and matching the suture morphology data and the biological traits data, standardising and regressing suture complexity metrics by centroid size to account for allometric biases; from this point onwards, only scaled residuals will be used. Continuous biological predictors are also mathematically standardised, but not regressed with size variables.
+
+```{r, 1) dataset preparation for PMM}
+
+# ============================================================
+# Dataset preparation pipeline for PMM
+# ============================================================
+
+library(ape)
+library(phytools)
+library(MCMCglmm)
+
+# -------------------------------
+# Load phylogeny
+# -------------------------------
+tree <- read.tree("D:/Marco_backups/pipeline/4705sp_mean.nwk") # filepath for the tree
+tree$tip.label <- gsub(" ", "_", tree$tip.label)
+
+# -------------------------------
+# Load suture-level measurements
+# -------------------------------
+data <- read.csv("D:/Marco_backups/pipeline/thrice_rescaled/complete_recast_metrics.csv", # file path for the complexity data set
+                 stringsAsFactors = FALSE)
+data$species <- gsub(" ", "_", data$species)
+
+# -------------------------------
+# Load species-level traits
+# -------------------------------
+species_traits <- read.csv("D:/Suppl_Mat/for_coauthors/Species_traits_sutures.csv", # file path for the biological trait data set
+                               stringsAsFactors = FALSE)
+species_traits$species <- gsub(" ", "_", species_traits$species)
+
+# -------------------------------
+# Normalize species names
+# -------------------------------
+data$species <- tolower(data$species)
+tree$tip.label <- tolower(tree$tip.label)
+species_traits$species <- tolower(species_traits$species)
+
+# -------------------------------
+# Filter to species in tree
+# -------------------------------
+data <- data[data$species %in% tree$tip.label, ]
+
+# Prune tree
+pruned_tree <- keep.tip(tree, unique(data$species))
+
+# Merge traits into suture-level dataset
+data <- merge(data, species_traits, by = "species", all.x = TRUE)
+
+# Create unique ID for each suture observation
+data$suture_id <- paste(data$species, data$suture, sep = "_")
+
+
+
+# -------------------------------
+# Make tree ultrametric + inverse A matrix
+# -------------------------------
+library("dispRity")
+# compute ages
+
+recent<-pruned_tree$tip.label
+ages <- tree.age(pruned_tree, digits = 10)
+
+# make all recent tips extant
+for(i in 1:length(recent)) {
+  
+  # get the tip
+  this_tip <- recent[i]
+  
+  # if this tip is in the tree...
+  if (this_tip %in% ages$elements) {
+  
+    # get the age
+    this_age <- ages$age[ages$elements == this_tip]
+    
+    # get the new age
+    new_age <- 0
+    
+    # get the old branch length
+    tip_index <- which(pruned_tree$tip.label == this_tip)
+    old_bl    <- pruned_tree$edge.length[pruned_tree$edge[,2] == tip_index]
+    
+    # compute the delta      
+    delta <- new_age - this_age
+    
+    # compute the new branch length
+    new_bl <- old_bl - delta
+    
+    # update the branch length
+   pruned_tree$edge.length[pruned_tree$edge[,2] == tip_index] <- new_bl
+    
+  }
+  
+}
+
+
+invA <- inverseA(pruned_tree, nodes = "TIPS", scale = TRUE)$Ainv
+pruned_tree -> nu_tree
+
+# Alignment sanity check
+if (!all(unique(data$species) %in% rownames(invA))) {
+  warning("Some species in data are not in the phylogenetic inverse matrix")
+}
+
+
+# -------------------------------
+# Define variables
+# -------------------------------
+responses <- c("best_alpha","Convexity","Rugosity",
+               "Sphericity","FD","centroid_size_mm")
+
+predictors <- c("primary_diet","locomotion","habitat", 
+                "suture","typical_lifespan","gestation_length", 
+               "ln_body_mass_g","ln_brain_mass_g","weaning_age")
+
+# -------------------------------
+# Factor handling
+# -------------------------------
+factor_vars <- c("primary_diet","locomotion","habitat","suture")
+factor_vars <- factor_vars[factor_vars %in% colnames(data)]
+data[factor_vars] <- lapply(data[factor_vars], factor)
+
+# -------------------------------
+# Check predictors and responses exist
+# -------------------------------
+existing_predictors <- predictors[predictors %in% colnames(data)]
+responses <- responses[responses %in% colnames(data)]
+
+# Keep only complete rows for predictors
+data <- data[complete.cases(data[, existing_predictors]), ]
+
+
+# -------------------------------
+# Create inverted complexity variables (1 / x), keep originals
+# -------------------------------
+
+invert_map <- c(
+  best_alpha   = "alpha_complexity",
+  Convexity    = "Concavity",
+  Sphericity   = "Antisphericity"
+)
+
+invert_map <- invert_map[names(invert_map) %in% colnames(data)]
+
+for (v in names(invert_map)) {
+  new_var <- invert_map[[v]]
+  
+  # Safety check
+  if (any(data[[v]] == 0, na.rm = TRUE)) {
+    stop(paste("Zero values detected in", v, "- cannot invert safely."))
+  }
+  
+  data[[new_var]] <- 1 / data[[v]]
+}
+
+
+# -------------------------------
+# Scale continuous variables
+# -------------------------------
+
+cont_vars <- c(
+  "best_alpha", "Convexity", "Rugosity",
+  "Sphericity",  "FD", "centroid_size_mm",
+  "typical_lifespan", "weaning_age",
+  "gestation_length", "ln_body_mass_g", "ln_brain_mass_g",
+  # NEW inverted variables
+  "alpha_complexity", "Concavity", "Antisphericity"
+)
+
+cont_vars <- cont_vars[cont_vars %in% colnames(data)]
+data[cont_vars] <- scale(data[cont_vars])
+
+
+# ============================================================
+# Allometry significance + residual extraction
+# ============================================================
+
+allometry_vars <- c("alpha_complexity", "Concavity", "Antisphericity", "best_alpha", "Convexity", "Rugosity","Sphericity", "FD")
+
+allometry_vars <- allometry_vars[allometry_vars %in% colnames(data)]
+
+results_list <- list()
+
+for (v in allometry_vars) {
+
+  # Fit linear model for allometry
+  model <- lm(data[[v]] ~ data$centroid_size_mm)
+
+  # Add residuals to dataset
+  data[[paste0(v, "_res")]] <- resid(model)
+
+  # Extract statistics
+  slope <- coef(summary(model))[2, 1]          # β1
+  p_value <- coef(summary(model))[2, 4]        # p-value for β1
+  r2 <- summary(model)$r.squared               # R²
+  
+  # Save results
+  results_list[[v]] <- data.frame(
+    variable = v,
+    slope = slope,
+    p_value = p_value,
+    r_squared = r2
+  )
+}
+
+# Combine into a single results table
+allometry_results <- do.call(rbind, results_list)
+
+# Show results
+allometry_results
+
+
+
+```
+
+>snippet 2: we set up and run a first round of multi-response phylogenetic mixed models (MR-PMM) to assess the relationships between morphological variables; this is an intercept-only model without predictors, which allows us to assess the phylogenetic vs residual correlations among morphological variables. It also allows us to estimate phylogenetic signal of each morphological response variable.
+
+```{r, 2) intercept-only MR(multi-response)-PMM + phylogenetic signal}
+# ============================================================
+# Intercept-only MR-PMM for phylogenetic vs residual correlations
+# ============================================================
+
+library(MCMCglmm)
+
+
+#reframe scaled residuals as responses
+responses <- c("alpha_complexity_res","Concavity_res","Rugosity_res",
+               "Antisphericity_res","FD_res")
+
+fit_intercept_only_model <- function(responses, data, nu_tree) {
+  df <- data
+  df <- df[complete.cases(df[, responses]), ]   # keep complete rows for all responses
+  df$animal <- df$species
+  
+  # Prior for multi-response: residual + phylo covariance
+  prior_multi <- list(
+    R = list(V = diag(length(responses)), nu = length(responses) + 0.002),
+    G = list(G1 = list(V = diag(length(responses)), nu = length(responses) + 0.002))
+  )
+  
+  # Intercept-only fixed formula (~ 1)
+  fixed_formula <- as.formula(
+    paste("cbind(", paste(responses, collapse = ", "), ") ~ 1")
+  )
+  
+  model <- MCMCglmm(
+    fixed = fixed_formula,
+    random = ~ us(trait):animal,   # phylogenetic covariance among traits
+    rcov   = ~ us(trait):units,    # residual covariance among traits
+    family = rep("gaussian", length(responses)),
+    pedigree = nu_tree,
+    data = df,
+    prior = prior_multi,
+    nitt = 80000, burnin = 20000, thin = 100,
+    verbose = FALSE
+  )
+  
+  return(model)
+}
+
+# -------------------------------
+# Run intercept-only MR-PMM
+# -------------------------------
+intercept_model <- fit_intercept_only_model(
+  responses = responses,
+  data = data,
+  nu_tree = nu_tree
+)
+
+par(mfrow=c(3,2), mar=c(2,2,1,0))
+plot(intercept_model$Sol, auto.layout=F)
+
+
+# -------------------------------
+# Save full model for later reload
+# -------------------------------
+saveRDS(intercept_model, "Intercept_only_MRPMM_scaled_last.rds")
+
+
+# -------------------------------
+# Extract correlations
+# -------------------------------
+
+# Posterior means of (co)variance matrices
+phylo_cov <- matrix(
+  colMeans(intercept_model$VCV[, grep("animal", colnames(intercept_model$VCV))]),
+  nrow = length(responses), byrow = TRUE
+)
+resid_cov <- matrix(
+  colMeans(intercept_model$VCV[, grep("units", colnames(intercept_model$VCV))]),
+  nrow = length(responses), byrow = TRUE
+)
+
+# Convert to correlations
+phylo_cor <- cov2cor(phylo_cov)
+resid_cor <- cov2cor(resid_cov)
+
+# Add row/column names for clarity
+rownames(phylo_cor) <- colnames(phylo_cor) <- responses
+rownames(resid_cor) <- colnames(resid_cor) <- responses
+
+# Save as CSVs
+write.csv(phylo_cor, "Phylogenetic_correlations_scaled_last.csv", row.names = TRUE)
+write.csv(resid_cor, "Residual_correlations_scaled_last.csv", row.names = TRUE)
+
+# Print quick check
+cat("\nPhylogenetic correlations:\n")
+print(round(phylo_cor, 3))
+cat("\nResidual correlations:\n")
+print(round(resid_cor, 3))
+
+
+
+# ============================================================
+# Compute phylogenetic signal per trait from intercept-only MR-PMM
+# ============================================================
+
+compute_phylo_signal <- function(model, responses) {
+  n_traits <- length(responses)
+  
+  # Extract variance components from posterior samples
+  VCV <- model$VCV
+  phylo_idx <- grep("animal", colnames(VCV))
+  resid_idx <- grep("units", colnames(VCV))
+  
+  phylo_signal_results <- list()
+  
+  for (i in 1:n_traits) {
+    # extract variance for this trait across MCMC samples
+    phylo_var <- VCV[, phylo_idx[(i - 1) * n_traits + i]]
+    resid_var <- VCV[, resid_idx[(i - 1) * n_traits + i]]
+    
+    h2 <- phylo_var / (phylo_var + resid_var)
+    
+    phylo_signal_results[[responses[i]]] <- data.frame(
+      Trait = responses[i],
+      Mean = mean(h2),
+      LowerCI = quantile(h2, 0.025),
+      UpperCI = quantile(h2, 0.975)
+    )
+  }
+  
+  phylo_signal_df <- do.call(rbind, phylo_signal_results)
+  return(phylo_signal_df)
+}
+
+# -------------------------------
+# Run signal computation
+# -------------------------------
+phylo_signal_df <- compute_phylo_signal(intercept_model, responses)
+
+print(phylo_signal_df)
+write.csv(phylo_signal_df, "Phylogenetic_signal_per_trait_scaled_last.csv", row.names = FALSE)
+
+
+```
+
+>snippet 3: for greater interpretability, we run single-response phylogenetic mixed models (SR-PMM) to estimate the predictor combinations that best explain each suture morphology variable. Predictors include biological traits (habitat, locomotion, diet, lifespan, gestation length, weaning age) and the classification of sutures within the dataset (suture identity). To maintain a reasonable runtime, a maximum of three predictors per model are tested, for all combinations of predictors.
+
+```{r, 3) SR(single-response)-PMM models}
+
+##running the SR model with size-corrected variables both for predictors and responses. Responses corrected by centroid size
+
+# -------------------------------
+# Define variables
+# -------------------------------
+responses <- c("alpha_complexity_res","Concavity_res","Rugosity_res",
+               "Antisphericity_res","FD_res")
+
+ 
+predictors <- c("suture", "primary_diet","locomotion","habitat",
+                "typical_lifespan","gestation_length", 
+                "ln_body_mass_g","ln_brain_mass_g","weaning_age")
+
+# -------------------------------
+# Factor handling
+# -------------------------------
+factor_vars <- c("primary_diet","locomotion","habitat","suture")
+factor_vars <- factor_vars[factor_vars %in% colnames(data)]
+data[factor_vars] <- lapply(data[factor_vars], factor)
+
+# -------------------------------
+# Check predictors and responses exist
+# -------------------------------
+existing_predictors <- predictors[predictors %in% colnames(data)]
+responses <- responses[responses %in% colnames(data)]
+
+# Keep only complete rows for predictors
+data <- data[complete.cases(data[, existing_predictors]), ]
+
+
+# -------------------------------
+# Make tree ultrametric + inverse A
+# -------------------------------
+library("dispRity")
+# compute ages
+
+recent<-pruned_tree$tip.label
+ages <- tree.age(pruned_tree, digits = 10)
+
+# make all recent tips extant
+for(i in 1:length(recent)) {
+  
+  # get the tip
+  this_tip <- recent[i]
+  
+  # if this tip is in the tree...
+  if (this_tip %in% ages$elements) {
+  
+    # get the age
+    this_age <- ages$age[ages$elements == this_tip]
+    
+    # get the new age
+    new_age <- 0
+    
+    # get the old branch length
+    tip_index <- which(pruned_tree$tip.label == this_tip)
+    old_bl    <- pruned_tree$edge.length[pruned_tree$edge[,2] == tip_index]
+    
+    # compute the delta      
+    delta <- new_age - this_age
+    
+    # compute the new branch length
+    new_bl <- old_bl - delta
+    
+    # update the branch length
+   pruned_tree$edge.length[pruned_tree$edge[,2] == tip_index] <- new_bl
+    
+  }
+  
+}
+
+
+invA <- inverseA(pruned_tree, nodes = "TIPS", scale = TRUE)$Ainv
+pruned_tree -> nu_tree
+
+# Alignment sanity check
+if (!all(unique(data$species) %in% rownames(invA))) {
+  warning("Some species in data are not in the phylogenetic inverse matrix")
+}
+
+# -------------------------------
+# Long format (optional, for univariate models)
+# -------------------------------
+long_data <- do.call(rbind, lapply(responses, function(trait) {
+  df <- data[, c("suture_id", "species", existing_predictors)]
+  df$trait_id <- trait
+  df$response <- data[[trait]]
+  return(df)
+}))
+
+long_data$trait_id <- factor(long_data$trait_id)
+long_data$animal <- long_data$species
+rownames(long_data) <- paste(long_data$suture_id, long_data$trait_id, sep = "_")
+
+# Scale continuous predictors in long_data
+cont_vars_long <- cont_vars[cont_vars %in% colnames(long_data)]
+long_data[cont_vars_long] <- scale(long_data[cont_vars_long])
+
+# -------------------------------
+# Sanity check outputs
+# -------------------------------
+cat("Responses available:", paste(responses, collapse = ", "), "\n")
+cat("Predictors used:", paste(existing_predictors, collapse = ", "), "\n")
+cat("Data rows (wide):", nrow(data), "\n")
+cat("Data rows (long):", nrow(long_data), "\n")
+
+str(long_data)
+str(data)
+
+data$animal <- data$species
+
+
+library(MCMCglmm)
+library(combinat)  # for predictor combinations
+
+get_predictor_combinations <- function(predictors, max_terms = 3) {
+  combos <- list()
+  for (i in 1:max_terms) {
+    combos <- c(combos, combn(predictors, i, simplify = FALSE))
+  }
+  return(combos)
+}
+
+
+
+# -------------------------------
+# Single-response (univariate) model selection
+# -------------------------------
+
+fit_single_response_models_fixed <- function(responses, data, predictors, nu_tree, max_predictors = 3) {
+  df <- data
+  df$animal <- df$species
+  
+  # Prior for univariate model: residual + phylo variance
+  prior_uni <- list(
+    R = list(V = 1, nu = 0.002),
+    G = list(G1 = list(V = 1, nu = 0.002))
+  )
+  
+  # Get all predictor combinations
+  predictor_sets <- get_predictor_combinations(predictors, max_terms = max_predictors)
+  
+  all_results <- list()
+  
+  for (trait in responses) {
+    cat("Running models for trait:", trait, "\n")
+    
+    df_trait <- df[complete.cases(df[, c(trait, predictors)]), ]
+    
+    trait_results <- list()
+    
+    for (pred_set in predictor_sets) {
+      pred_str <- paste(pred_set, collapse = " + ")
+      fixed_formula <- as.formula(paste(trait, "~", pred_str))
+      
+      tryCatch({
+        model <- MCMCglmm(
+          fixed = fixed_formula,
+          random = ~ animal,          # phylogenetic effect
+          rcov   = ~ units,           # residual
+          family = "gaussian",
+          pedigree = nu_tree,
+          data = df_trait,
+          prior = prior_uni,
+          nitt = 80000, burnin = 20000, thin = 100,
+          verbose = FALSE
+        )
+        
+        trait_results[[pred_str]] <- list(
+          model = model,
+          DIC = model$DIC,
+          predictors = pred_set,
+          fixed_effects = summary(model)$solutions
+        )
+        
+        cat("Finished model | Trait:", trait, "| Predictors:", pred_str, "| DIC:", model$DIC, "\n")
+      }, error = function(e) {
+        cat("Error fitting model for trait:", trait, "| Predictors:", pred_str, "\n")
+      })
+    }
+    
+    if (length(trait_results) > 0) {
+      best_model <- trait_results[[which.min(sapply(trait_results, function(x) x$DIC))]]
+      all_results[[trait]] <- list(
+        all_models = trait_results,
+        best_model = best_model,
+        best_DIC = best_model$DIC,
+        best_predictors = best_model$predictors
+      )
+    }
+  }
+  
+  return(all_results)
+}
+
+# -------------------------------
+# Run single-response selection
+# -------------------------------
+single_results_fixed <- fit_single_response_models_fixed(
+  responses = responses,
+  data = data,
+  predictors = predictors,
+  nu_tree = nu_tree,
+  max_predictors = 3
+)
+saveRDS(single_results_fixed, "SR_suturefixed_last.RDS")
+
+# -------------------------------
+# Summarize best models for each trait
+# -------------------------------
+best_models_summary <- do.call(rbind, lapply(names(single_results_fixed), function(trait) {
+  res <- single_results_fixed[[trait]]
+  data.frame(
+    Trait = trait,
+    DIC = res$best_DIC,
+    Predictors = paste(res$best_predictors, collapse = ", "),
+    stringsAsFactors = FALSE
+  )
+}))
+
+print(best_models_summary)
+write.csv(best_models_summary, "Best_single_response_models_scaled_suturefixed_last.csv", row.names = FALSE)
+
+# -------------------------------
+# Summarize all models for each trait
+# -------------------------------
+
+all_models_summary <- do.call(rbind, lapply(names(single_results_fixed), function(trait) {
+  res <- single_results_fixed[[trait]]
+  
+  if (is.null(res$all_models)) return(NULL)  # skip if no models
+  
+  do.call(rbind, lapply(res$all_models, function(mod) {
+    data.frame(
+      Trait = trait,
+      DIC = mod$DIC,
+      Predictors = paste(mod$predictors, collapse = ", "),
+      stringsAsFactors = FALSE
+    )
+  }))
+}))
+
+# Sort by trait, then DIC
+all_models_summary <- all_models_summary[order(all_models_summary$Trait, all_models_summary$DIC), ]
+
+print(all_models_summary)
+write.csv(all_models_summary, "All_single_response_models_scaled_suturefixed_last.csv", row.names = FALSE)
+
+
+#single_results_fixed<-readRDS("SR_suturefixed_last.RDS")
+
+```
+
+>snippet 4: given that suture identity (var. name 'suture') is retrieved as being consistently and by far the strongest predictor of each suture morphology response variable (indicating that sutures are significantly different from each other), suture identity is recast as a random effect in addition to phylogenetic structure. This is to unbias further analyses from the effect of differences among sutures across skulls.
+
+```{r, 4) SR-PMM models with suture as random effect}
+
+##running the SR model with size-corrected variables both for predictors and responses. Responses corrected by centroid size
+
+# -------------------------------
+# Define variables
+# -------------------------------
+responses <- c("alpha_complexity_res","Concavity_res","Rugosity_res",
+               "Antisphericity_res","FD_res")
+
+# ❌ remove "suture" from predictors
+predictors <- c("primary_diet","locomotion","habitat",
+                "typical_lifespan","gestation_length", 
+                "ln_body_mass_g","ln_brain_mass_g","weaning_age")
+
+# -------------------------------
+# Factor handling
+# -------------------------------
+factor_vars <- c("primary_diet","locomotion","habitat")
+factor_vars <- factor_vars[factor_vars %in% colnames(data)]
+data[factor_vars] <- lapply(data[factor_vars], factor)
+
+# -------------------------------
+# Check predictors and responses exist
+# -------------------------------
+existing_predictors <- predictors[predictors %in% colnames(data)]
+responses <- responses[responses %in% colnames(data)]
+
+# Keep only complete rows for predictors
+data <- data[complete.cases(data[, existing_predictors]), ]
+
+
+# -------------------------------
+# Make tree ultrametric + inverse A
+# -------------------------------
+library("dispRity")
+# compute ages
+
+recent<-pruned_tree$tip.label
+ages <- tree.age(pruned_tree, digits = 10)
+
+# make all recent tips extant
+for(i in 1:length(recent)) {
+  
+  # get the tip
+  this_tip <- recent[i]
+  
+  # if this tip is in the tree...
+  if (this_tip %in% ages$elements) {
+  
+    # get the age
+    this_age <- ages$age[ages$elements == this_tip]
+    
+    # get the new age
+    new_age <- 0
+    
+    # get the old branch length
+    tip_index <- which(pruned_tree$tip.label == this_tip)
+    old_bl    <- pruned_tree$edge.length[pruned_tree$edge[,2] == tip_index]
+    
+    # compute the delta      
+    delta <- new_age - this_age
+    
+    # compute the new branch length
+    new_bl <- old_bl - delta
+    
+    # update the branch length
+   pruned_tree$edge.length[pruned_tree$edge[,2] == tip_index] <- new_bl
+    
+  }
+  
+}
+
+
+invA <- inverseA(pruned_tree, nodes = "TIPS", scale = TRUE)$Ainv
+pruned_tree -> nu_tree
+
+# Alignment sanity check
+if (!all(unique(data$species) %in% rownames(invA))) {
+  warning("Some species in data are not in the phylogenetic inverse matrix")
+}
+
+# -------------------------------
+# Long format (optional, for univariate models)
+# -------------------------------
+long_data <- do.call(rbind, lapply(responses, function(trait) {
+  df <- data[, c("suture_id", "species", existing_predictors)]
+  df$trait_id <- trait
+  df$response <- data[[trait]]
+  return(df)
+}))
+
+long_data$trait_id <- factor(long_data$trait_id)
+long_data$animal <- long_data$species
+rownames(long_data) <- paste(long_data$suture_id, long_data$trait_id, sep = "_")
+
+# Scale continuous predictors in long_data
+cont_vars_long <- cont_vars[cont_vars %in% colnames(long_data)]
+long_data[cont_vars_long] <- scale(long_data[cont_vars_long])
+
+# -------------------------------
+# Sanity check outputs
+# -------------------------------
+cat("Responses available:", paste(responses, collapse = ", "), "\n")
+cat("Predictors used:", paste(existing_predictors, collapse = ", "), "\n")
+cat("Data rows (wide):", nrow(data), "\n")
+cat("Data rows (long):", nrow(long_data), "\n")
+
+str(long_data)
+str(data)
+
+data$animal <- data$species
+
+
+library(MCMCglmm)
+library(combinat)  # for predictor combinations
+
+get_predictor_combinations <- function(predictors, max_terms = 3) {
+  combos <- list()
+  for (i in 1:max_terms) {
+    combos <- c(combos, combn(predictors, i, simplify = FALSE))
+  }
+  return(combos)
+}
+
+
+# -------------------------------
+# Single-response (univariate) model selection
+# -------------------------------
+fit_single_response_models <- function(responses, data, predictors, nu_tree, max_predictors = 3) {
+  df <- data
+  df$animal <- df$species  # phylogenetic grouping factor
+  
+  # Prior for univariate model: residual + phylo variance + suture variance
+  prior_uni <- list(
+    R = list(V = 1, nu = 0.002),
+    G = list(
+      G1 = list(V = 1, nu = 0.002),  # phylogeny
+      G2 = list(V = 1, nu = 0.002)   # suture
+    )
+  )
+
+  # Get all predictor combinations
+  predictor_sets <- get_predictor_combinations(predictors, max_terms = max_predictors)
+  
+  all_results <- list()
+  
+  for (trait in responses) {
+    cat("Running models for trait:", trait, "\n")
+    
+    df_trait <- df[complete.cases(df[, c(trait, predictors, "suture")]), ]
+    
+    trait_results <- list()
+    
+    for (pred_set in predictor_sets) {
+      pred_str <- paste(pred_set, collapse = " + ")
+      fixed_formula <- as.formula(paste(trait, "~", pred_str))  
+      
+      tryCatch({
+        model <- MCMCglmm(
+          fixed    = fixed_formula,
+          random   = ~ animal + suture,   # ✅ phylogeny + suture
+          rcov     = ~ units,
+          family   = "gaussian",
+          pedigree = nu_tree,
+          data     = df_trait,
+          prior    = prior_uni,
+          nitt     = 80000, burnin = 20000, thin = 100,
+          verbose  = FALSE
+        )
+        
+        trait_results[[pred_str]] <- list(
+          model = model,
+          DIC = model$DIC,
+          predictors = pred_set,
+          fixed_effects = summary(model)$solutions
+        )
+        
+        cat("Finished model | Trait:", trait, "| Predictors:", pred_str, "| DIC:", model$DIC, "\n")
+      }, error = function(e) {
+        cat("Error fitting model for trait:", trait, "| Predictors:", pred_str, "\n")
+      })
+    }
+    
+    if (length(trait_results) > 0) {
+      best_model <- trait_results[[which.min(sapply(trait_results, function(x) x$DIC))]]
+      all_results[[trait]] <- list(
+        all_models = trait_results,
+        best_model = best_model,
+        best_DIC = best_model$DIC,
+        best_predictors = best_model$predictors
+      )
+    }
+  }
+  
+  return(all_results)
+}
+
+# -------------------------------
+# Run single-response selection
+# -------------------------------
+single_results_random_fixed_last <- fit_single_response_models(
+  responses = responses,
+  data = data,
+  predictors = predictors,
+  nu_tree = nu_tree,
+  max_predictors = 3
+)
+
+saveRDS(single_results_random_fixed_last, "SR_random_fixed_individual_last.RDS")
+
+# -------------------------------
+# Summarize best models for each trait
+# -------------------------------
+best_models_summary_last <- do.call(rbind, lapply(names(single_results_random_fixed_last), function(trait) {
+  res <- single_results_random_fixed_last[[trait]]
+  data.frame(
+    Trait = trait,
+    DIC = res$best_DIC,
+    Predictors = paste(res$best_predictors, collapse = ", "),
+    stringsAsFactors = FALSE
+  )
+}))
+
+print(best_models_summary_last)
+write.csv(best_models_summary_last, "Best_single_response_models_random_scaled_fixed_last.csv", row.names = FALSE)
+
+# -------------------------------
+# Summarize all models for each trait
+# -------------------------------
+
+all_models_summary <- do.call(rbind, lapply(names(single_results_random_fixed_last), function(trait) {
+  res <- single_results_random_fixed_last[[trait]]
+  
+  if (is.null(res$all_models)) return(NULL)  # skip if no models
+  
+  do.call(rbind, lapply(res$all_models, function(mod) {
+    data.frame(
+      Trait = trait,
+      DIC = mod$DIC,
+      Predictors = paste(mod$predictors, collapse = ", "),
+      stringsAsFactors = FALSE
+    )
+  }))
+}))
+
+# Sort by trait, then DIC
+all_models_summary <- all_models_summary[order(all_models_summary$Trait, all_models_summary$DIC), ]
+
+print(all_models_summary)
+write.csv(all_models_summary, "All_single_response_models_random_scaled_fixed_last.csv", row.names = FALSE)
+
+
+# -------------------------------
+# Ensure save directory exists
+# -------------------------------
+save_dir <- "random_single_models_scaled_fixed_last"
+if (!dir.exists(save_dir)) dir.create(save_dir, showWarnings = TRUE)
+
+# -------------------------------
+# Helper to create safe filenames
+# -------------------------------
+safe_filename <- function(x) {
+  # Replace any non-alphanumeric characters with underscore
+  gsub("[^[:alnum:]_]", "_", x)
+}
+
+# -------------------------------
+# Save all models safely
+# -------------------------------
+for (trait in names(single_results_random_fixed_last)) {
+  res <- single_results_random_fixed_last[[trait]]
+  
+  if (!is.null(res$all_models)) {
+    for (mod_name in names(res$all_models)) {
+      model_obj <- res$all_models[[mod_name]]$model
+      safe_name <- safe_filename(mod_name)
+      filename <- file.path(save_dir, paste0("random_", trait, "_", safe_name, ".rds"))
+      
+      tryCatch({
+        saveRDS(model_obj, file = filename)
+        cat("Saved model for trait", trait, "with predictors", mod_name, "->", filename, "\n")
+      }, error = function(e) {
+        cat("Failed to save model for trait", trait, "with predictors", mod_name, "\n",
+            "Error:", e$message, "\n")
+      })
+    }
+  }
+  
+  # Save best model
+  best_model <- res$best_model$model
+  filename_best <- file.path(save_dir, paste0("best_random_scaled_fixed_last", trait, "_best_model.rds"))
+  
+  tryCatch({
+    saveRDS(best_model, file = filename_best)
+    cat("Saved BEST model for trait", trait, "->", filename_best, "\n")
+  }, error = function(e) {
+    cat("Failed to save BEST model for trait", trait, "\n", "Error:", e$message, "\n")
+  })
+}
+
+
+
+
+```
+
+>snippet 5: SR-PMM models with interaction between fixed effects. This is to test the interactions between predictors for the most supported models from (4)
+
+```{r, 5) specific SR-PMM interaction models to test hypotheses}
+# ============================================================
+# RUN ONLY USER-DEFINED INTERACTION MODELS (MCMCglmm)
+# ============================================================
+
+library(MCMCglmm)
+
+# ------------------------------------------------------------
+# 1. PRIOR (same as pipeline univariate prior)
+# ------------------------------------------------------------
+prior_uni <- list(
+  R = list(V = 1, nu = 0.002),
+  G = list(
+    G1 = list(V = 1, nu = 0.002),  # phylogeny (animal)
+    G2 = list(V = 1, nu = 0.002)   # suture
+  )
+)
+
+# ------------------------------------------------------------
+# 2. FUNCTION TO RUN ONLY SELECTED MODELS
+# ------------------------------------------------------------
+run_specific_models <- function(model_list, data, nu_tree) {
+  
+  results <- list()
+  
+  for (name in names(model_list)) {
+    f <- model_list[[name]]
+    cat("\n=============================================\n")
+    cat("Running:", name, "\nFormula:", deparse(f), "\n")
+    cat("=============================================\n")
+    
+    # extract variables from formula
+    vars <- all.vars(f)
+    
+    # remove missing rows
+    df_sub <- data[complete.cases(data[, vars]), ]
+    
+    # fit model
+    model <- MCMCglmm(
+      fixed = f,
+      random = ~ animal + suture,
+      rcov = ~ units,
+      family = "gaussian",
+      pedigree = nu_tree,
+      data = df_sub,
+      prior = prior_uni,
+      nitt = 80000, burnin = 20000, thin = 100,
+      verbose = FALSE
+    )
+    
+    # store result
+    results[[name]] <- list(
+      formula = f,
+      model = model,
+      DIC = model$DIC,
+      fixed_effects = summary(model)$solutions,
+      random_effects = summary(model)$Gcovariances,
+      diagnostics = list(
+        autocorr = autocorr.diag(model$Sol),
+        heidel = heidel.diag(model$Sol),
+        geweke = geweke.diag(model$Sol)
+      )
+    )
+    
+    cat("Finished:", name, "| DIC =", model$DIC, "\n")
+  }
+  
+  return(results)
+}
+
+# ------------------------------------------------------------
+# 3. DEFINE ONLY THE MODELS YOU WANT TO RUN
+# ------------------------------------------------------------
+
+custom_models <- list(
+  "Concavity_gestXdiet"   = Concavity_res ~ gestation_length:primary_diet,
+  "Antisphericity_gestXdiet"  = Antisphericity_res ~ gestation_length:primary_diet, 
+  "FD_gestXdiet" = FD_res ~ gestation_length:primary_diet,
+  "alpha_gestXdiet" = alpha_complexity_res ~ gestation_length:primary_diet,
+  "Concavity_gestXbody"   = Concavity_res ~ gestation_length:ln_body_mass_g,
+  "Antisphericity_gestXbody"  = Antisphericity_res ~ gestation_length:ln_body_mass_g, 
+  "FD_gestXbody" = FD_res ~ gestation_length:ln_body_mass_g,
+  "alpha_gestXbody" = alpha_complexity_res ~ gestation_length:ln_body_mass_g,
+  "Concavity_gestXbrain"   = Concavity_res ~ gestation_length:ln_brain_mass_g,
+  "Antisphericity_gestXbrain"  = Antisphericity_res ~ gestation_length:ln_brain_mass_g, 
+  "FD_gestXbrain" = FD_res ~ gestation_length:ln_brain_mass_g,
+   "alpha_gestXbrain" = alpha_complexity_res ~ gestation_length:ln_brain_mass_g,
+ "Concavity_gestXlocomotion"   = Concavity_res ~ gestation_length:locomotion,
+  "Antisphericity_gestXlocomotion"  = Antisphericity_res ~ gestation_length:locomotion, 
+  "FD_gestXlocomotion" = FD_res ~ gestation_length:locomotion,  
+ "alpha_gestXlocomotion" = alpha_complexity_res ~ gestation_length:locomotion,
+ 
+   "Concavity_weanXdiet"   = Concavity_res ~ weaning_age:primary_diet,
+  "Antisphericity_weanXdiet"  = Antisphericity_res ~ weaning_age:primary_diet, 
+  "FD_weanXdiet" = FD_res ~ weaning_age:primary_diet,
+  "alpha_weanXdiet" = alpha_complexity_res ~ weaning_age:primary_diet,
+  "Concavity_weanXbody"   = Concavity_res ~ weaning_age:ln_body_mass_g,
+  "Antisphericity_weanXbody"  = Antisphericity_res ~ weaning_age:ln_body_mass_g, 
+  "FD_weanXbody" = FD_res ~ weaning_age:ln_body_mass_g,
+  "alpha_weanXbody" = alpha_complexity_res ~ weaning_age:ln_body_mass_g,
+  "Concavity_weanXbrain"   = Concavity_res ~ weaning_age:ln_brain_mass_g,
+  "Antisphericity_weanXbrain"  = Antisphericity_res ~ weaning_age:ln_brain_mass_g, 
+  "FD_weanXbrain" = FD_res ~ weaning_age:ln_brain_mass_g,
+   "alpha_weanXbrain" = alpha_complexity_res ~ weaning_age:ln_brain_mass_g,
+ "Concavity_weanXlocomotion"   = Concavity_res ~ weaning_age:locomotion,
+  "Antisphericity_weanXlocomotion"  = Antisphericity_res ~ weaning_age:locomotion, 
+  "FD_weanXlocomotion" = FD_res ~ weaning_age:locomotion,  
+ "alpha_weanXlocomotion" = alpha_complexity_res ~ weaning_age:locomotion,
+ 
+    "Concavity_lifeXdiet"   = Concavity_res ~ typical_lifespan:primary_diet,
+  "Antisphericity_lifeXdiet"  = Antisphericity_res ~ typical_lifespan:primary_diet, 
+  "FD_lifeXdiet" = FD_res ~ typical_lifespan:primary_diet,
+  "alpha_lifeXdiet" = alpha_complexity_res ~ typical_lifespan:primary_diet,
+  "Concavity_lifeXbody"   = Concavity_res ~ typical_lifespan:ln_body_mass_g,
+  "Antisphericity_lifeXbody"  = Antisphericity_res ~ typical_lifespan:ln_body_mass_g, 
+  "FD_lifeXbody" = FD_res ~ typical_lifespan:ln_body_mass_g,
+  "alpha_lifeXbody" = alpha_complexity_res ~ typical_lifespan:ln_body_mass_g,
+  "Concavity_lifeXbrain"   = Concavity_res ~ typical_lifespan:ln_brain_mass_g,
+  "Antisphericity_lifeXbrain"  = Antisphericity_res ~ typical_lifespan:ln_brain_mass_g, 
+  "FD_lifeXbrain" = FD_res ~ typical_lifespan:ln_brain_mass_g,
+   "alpha_lifeXbrain" = alpha_complexity_res ~ typical_lifespan:ln_brain_mass_g,
+ "Concavity_lifeXlocomotion"   = Concavity_res ~ typical_lifespan:locomotion,
+  "Antisphericity_lifeXlocomotion"  = Antisphericity_res ~ typical_lifespan:locomotion, 
+  "FD_lifeXlocomotion" = FD_res ~ typical_lifespan:locomotion,  
+ "alpha_lifeXlocomotion" = alpha_complexity_res ~ typical_lifespan:locomotion,
+ 
+     "Concavity_bodyXdiet"   = Concavity_res ~ ln_body_mass_g:primary_diet,
+  "Antisphericity_bodyXdiet"  = Antisphericity_res ~ ln_body_mass_g:primary_diet, 
+  "FD_bodyXdiet" = FD_res ~ ln_body_mass_g:primary_diet,
+  "alpha_bodyXdiet" = alpha_complexity_res ~ ln_body_mass_g:primary_diet,
+  "Concavity_bodyXbrain"   = Concavity_res ~ ln_body_mass_g:ln_brain_mass_g,
+  "Antisphericity_bodyXbrain"  = Antisphericity_res ~ ln_body_mass_g:ln_brain_mass_g, 
+  "FD_bodyXbrain" = FD_res ~ ln_body_mass_g:ln_brain_mass_g,
+   "alpha_bodyXbrain" = alpha_complexity_res ~ ln_body_mass_g:ln_brain_mass_g,
+ "Concavity_bodyXlocomotion"   = Concavity_res ~ ln_body_mass_g:locomotion,
+  "Antisphericity_bodyXlocomotion"  = Antisphericity_res ~ ln_body_mass_g:locomotion, 
+  "FD_bodyXlocomotion" = FD_res ~ ln_body_mass_g:locomotion,  
+ "alpha_bodyXlocomotion" = alpha_complexity_res ~ ln_body_mass_g:locomotion,
+ 
+      "Concavity_brainXdiet"   = Concavity_res ~ ln_brain_mass_g:primary_diet,
+  "Antisphericity_brainXdiet"  = Antisphericity_res ~ ln_brain_mass_g:primary_diet, 
+  "FD_brainXdiet" = FD_res ~ ln_brain_mass_g:primary_diet,
+  "alpha_brainXdiet" = alpha_complexity_res ~ ln_brain_mass_g:primary_diet,
+ "Concavity_brainXlocomotion"   = Concavity_res ~ ln_brain_mass_g:locomotion,
+  "Antisphericity_brainXlocomotion"  = Antisphericity_res ~ ln_brain_mass_g:locomotion, 
+  "FD_brainXlocomotion" = FD_res ~ ln_brain_mass_g:locomotion,  
+ "alpha_brainXlocomotion" = alpha_complexity_res ~ ln_brain_mass_g:locomotion
+ 
+ 
+ )
+
+# Add more by uncommenting:
+# custom_models$FD_interaction <- FD_res ~ primary_diet:weaning_age
+
+# ------------------------------------------------------------
+# 4. RUN THE MODELS
+# ------------------------------------------------------------
+specific_results <- run_specific_models(
+  model_list = custom_models,
+  data = data,
+  nu_tree = nu_tree
+)
+
+# ------------------------------------------------------------
+# 5. PRINT RESULTS
+# ------------------------------------------------------------
+
+cat("\n\n########### DIC VALUES ###########\n")
+for (name in names(specific_results)) {
+  cat(name, ":", specific_results[[name]]$DIC, "\n")
+}
+
+cat("\n\n########### FIXED EFFECTS ###########\n")
+for (name in names(specific_results)) {
+  cat("\n---", name, "---\n")
+  print(specific_results[[name]]$fixed_effects)
+}
+
+# ------------------------------------------------------------
+# 6. SAVE RESULTS
+# ------------------------------------------------------------
+saveRDS(specific_results, "specific_interaction_models_last.RDS")
+
+cat("\nSaved results to specific_interaction_models.RDS\n")
+
+
+levels(data$suture)
+
+
+# ------------------------------------------------------------
+# Combine DIC + fixed effects into one table
+# ------------------------------------------------------------
+combined_df <- do.call(rbind, lapply(names(specific_results), function(name) {
+  
+  res <- specific_results[[name]]
+  
+  if (is.null(res$fixed_effects)) return(NULL)
+  
+  fe <- as.data.frame(res$fixed_effects)
+  fe$predictor <- rownames(fe)
+  rownames(fe) <- NULL
+  
+  # rename columns if needed (MCMCglmm typical output)
+  colnames(fe) <- gsub("post.mean", "estimate", colnames(fe))
+  colnames(fe) <- gsub("l-95% CI", "CI_lower", colnames(fe))
+  colnames(fe) <- gsub("u-95% CI", "CI_upper", colnames(fe))
+  
+  fe$model <- name
+  fe$DIC <- res$DIC
+  
+  fe
+}))
+
+# reorder columns
+combined_df <- combined_df[, c(
+  "model",
+  "predictor",
+  "estimate",
+  "CI_lower",
+  "CI_upper",
+  "pMCMC",
+  "DIC"
+)]
+
+# write csv
+write.csv(combined_df, "specific_results_summary.csv", row.names = FALSE)
+
+# preview
+head(combined_df)
+
+
+
+```
+
+>snippet 6: a helper to create detailed summaries of the above models
+
+```{r, 6) helper for detailed model summaries}
+# ============================================================
+# Summarize existing models without refitting
+# ============================================================
+
+fixed_sutures<-readRDS("D:/Marco_backups/pipeline/SR_suturefixed_last.RDS")
+
+if (!is.null(fixed_sutures)) { #'single_result_fixed' is a dummy object. Substitute every instance with name of a model results object
+  
+  all_models_summary <- do.call(rbind, lapply(names(fixed_sutures), function(trait) {
+    res <- fixed_sutures[[trait]]
+    
+    if (is.null(res$all_models)) return(NULL)  # skip if no models
+    
+    do.call(rbind, lapply(res$all_models, function(x) {
+      model <- x$model
+      
+      # Fixed effect summaries
+      fixed <- data.frame(summary(model)$solutions)
+      fixed$Predictor <- rownames(fixed)
+      
+      # Optional pseudo-R² (wrapped in tryCatch to avoid crashes)
+    #  r2_vals <- tryCatch({
+    #    MCMCglmm::modelR2(model)
+    #  }, error = function(e) NULL)
+      
+      # Add metadata columns
+      fixed$Trait <- trait
+      fixed$Predictors_set <- paste(x$predictors, collapse = ", ")
+      fixed$DIC <- x$DIC
+     # fixed$R2 <- if (!is.null(r2_vals)) paste(round(r2_vals, 3), collapse = "; ") else NA
+      
+      fixed
+    }))
+  }))
+  #order by trait and DIC
+  all_models_summary <- all_models_summary[order(all_models_summary$Trait, all_models_summary$DIC), ]
+  # Save as CSV
+  write.csv(all_models_summary, "fixed_sutures.csv", row.names = FALSE) #change name of csv to avoid overwriting previous csvs
+  print(head(all_models_summary))
+} 
+
+(all_models_summary)
+
+
+```
+
+>snippet 7: a helper to select top models per response trait based on their DIC difference from best model
+
+```{r, 7) helper for top model selection}
+# Load model summary spreadsheet
+df <- read.csv("D:/Marco_backups/pipeline/fixed_sutures.csv", stringsAsFactors = FALSE)
+
+# Ensure DIC is numeric
+df$DIC <- as.numeric(df$DIC)
+
+# Compute ΔDIC per Trait
+df_filtered <- do.call(rbind, lapply(split(df, df$Trait), function(subdf) {
+  
+  # Find minimum DIC for this trait
+  min_dic <- min(subdf$DIC, na.rm = TRUE)
+  
+  # Compute ΔDIC
+  subdf$Delta_DIC <- subdf$DIC - min_dic
+  
+  # Keep rows with ΔDIC ≤ 5
+  subdf[subdf$Delta_DIC <= 5, ]
+}))
+
+# Save new filtered table
+write.csv(df_filtered, "fixed_sutures_filtered.csv", row.names = FALSE)
+
+
+# additional filtering to keep only significant models
+df <- read.csv("fixed_sutures_filtered.csv", header = TRUE)
+
+# Select significant effects based on pMCMC and non-overlap with zero
+sig_models <- subset(df, pMCMC < 0.05,
+         l.95..CI > 0 | u.95..CI < 0)
+
+# View results
+sig_models
+
+write.csv(sig_models, "fixed_sutures_filtered_signif.csv", row.names = FALSE)
+
+```
+
+>snippet 8: a helper to recenter and plot significant pairwise contrasts to include the base intercept level
+
+```{r, 8) helper for posterior pairwise contrast rebalancing and plotting}
+library(MCMCglmm)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+
+# ------------------------------------------------------------
+# 1. Load model
+# ------------------------------------------------------------
+model_path <- "D:/Marco_backups/pipeline/SR_random_fixed_individual_last.RDS"
+model <- readRDS(model_path)
+
+alpha_names <- names(model)
+
+pairwise_results <- list()
+
+out_dir <- "pairwise_plots_habitat_last"
+if (!dir.exists(out_dir)) {
+  dir.create(out_dir)
+}
+
+for (alpha in alpha_names) {
+
+  message("Processing: ", alpha)
+
+  # ----------------------------------------------------------
+  # Safety check
+  # ----------------------------------------------------------
+  if (!"all_models" %in% names(model[[alpha]])) next
+
+  model_list <- model[[alpha]]$all_models
+
+  # ----------------------------------------------------------
+  # Collect DIC values
+  # ----------------------------------------------------------
+  model_dics <- sapply(model_list, function(m) {
+    if (!is.null(m$model$DIC)) m$model$DIC else NA
+  })
+
+  model_dics <- model_dics[!is.na(model_dics)]
+  if (length(model_dics) == 0) next
+
+  best_dic <- min(model_dics)
+  delta_dic <- model_dics - best_dic
+
+  # ----------------------------------------------------------
+  # Check if habitat model exists
+  # ----------------------------------------------------------
+  if (!"habitat" %in% names(model_list)) next
+
+  primary_delta_dic <- delta_dic["habitat"]
+
+  message("Best DIC: ", best_dic)
+  message("habitat ΔDIC: ", primary_delta_dic)
+
+  # ----------------------------------------------------------
+  # Filter BEFORE posterior extraction
+  # ----------------------------------------------------------
+  if (is.na(primary_delta_dic) || primary_delta_dic > 5) {
+    message("Skipping ", alpha, " (ΔDIC > 5)")
+    next
+  }
+
+  # ----------------------------------------------------------
+  # Extract posterior draws
+  # ----------------------------------------------------------
+  post <- as.data.frame(
+    model_list$habitat$model$Sol
+  )
+
+  # Identify habitat columns
+  habitat_cols <- grep("^habitat", colnames(post), value = TRUE)
+  if (length(habitat_cols) == 0) next
+
+  # ----------------------------------------------------------
+  # Reconstruct posterior means for each level
+  # ----------------------------------------------------------
+  baseline <- post$`(Intercept)`
+
+  habitat_posteriors <- lapply(habitat_cols, function(col)
+    baseline + post[[col]]
+  )
+
+  names(habitat_posteriors) <- gsub("^habitat", "", habitat_cols)
+
+  # Add reference level
+  habitat_posteriors[["reference"]] <- baseline
+
+  # ----------------------------------------------------------
+  # Pairwise combinations
+  # ----------------------------------------------------------
+  habitat_names <- names(habitat_posteriors)
+
+  pairs <- expand.grid(habitat_names, habitat_names, stringsAsFactors = FALSE)
+  pairs <- pairs[pairs$Var1 != pairs$Var2, ]
+
+  # ----------------------------------------------------------
+  # Posterior summaries
+  # ----------------------------------------------------------
+  pairwise_diffs <- apply(pairs, 1, function(x) {
+
+    diff_post <- habitat_posteriors[[x[1]]] - habitat_posteriors[[x[2]]]
+
+    data.frame(
+      alpha      = alpha,
+      Comparison = paste(x[1], "−", x[2]),
+      post_mean  = mean(diff_post),
+      CI_lower   = quantile(diff_post, 0.025),
+      CI_upper   = quantile(diff_post, 0.975),
+      pMCMC      = 2 * min(mean(diff_post > 0), mean(diff_post < 0))
+    )
+
+  }) |> bind_rows()
+
+  # ----------------------------------------------------------
+  # Full posterior draws
+  # ----------------------------------------------------------
+  pairwise_post <- apply(pairs, 1, function(x) {
+
+    diff_post <- habitat_posteriors[[x[1]]] - habitat_posteriors[[x[2]]]
+
+    data.frame(
+      alpha      = alpha,
+      Comparison = paste(x[1], "−", x[2]),
+      diff       = diff_post
+    )
+
+  }) |> bind_rows()
+
+  # ----------------------------------------------------------
+  # Filter significant contrasts
+  # ----------------------------------------------------------
+  sig_names <- pairwise_diffs %>%
+    filter(pMCMC <= 0.05) %>%
+    pull(Comparison)
+
+  pairwise_post_sig <- pairwise_post %>%
+    filter(Comparison %in% sig_names)
+
+  # ----------------------------------------------------------
+  # Store results
+  # ----------------------------------------------------------
+  pairwise_results[[alpha]] <- list(
+    summary  = pairwise_diffs,
+    post_sig = pairwise_post_sig,
+    deltaDIC = primary_delta_dic,
+    bestDIC  = best_dic
+  )
+}
+
+ 
+pairwise_alpha_habitat <- pairwise_results$alpha_complexity_res$summary%>%
+    filter(pMCMC <= 0.05 | CI_lower > 0 | CI_upper < 0)
+
+pairwise_FD_habitat <- pairwise_results$FD_res$summary%>%
+    filter(pMCMC <= 0.05 | CI_lower > 0 | CI_upper < 0)
+
+pairwise_Concavity_habitat <- pairwise_results$Concavity_res$summary%>%
+    filter(pMCMC <= 0.05 | CI_lower > 0 | CI_upper < 0)
+
+pairwise_Antisphericity_habitat <- pairwise_results$Antisphericity_res$summary%>%
+    filter(pMCMC <= 0.05 | CI_lower > 0 | CI_upper < 0)
+
+pairwise_Rugosity_habitat <- pairwise_results$Rugosity_res$summary%>%
+    filter(pMCMC <= 0.05 | CI_lower > 0 | CI_upper < 0)
+
+
+combined_results <- bind_rows(
+  pairwise_alpha_habitat,
+  pairwise_FD_habitat,
+  pairwise_Concavity_habitat,
+  pairwise_Antisphericity_habitat,
+  pairwise_Rugosity_habitat
+)
+
+write.csv(combined_results, "pairwise_habitat_results.csv", row.names = FALSE) # repeat by substituting 'habitat' with 'locomotion' or 'primary_diet' across the whole snippet
+
+```
+
+>snippet 9: a helper to generate sankey plots of signficant effect across models
+
+```{r, 9) helper function to generate sankey plot of significant effects}
+library(dplyr)
+library(ggplot2)
+library(ggsankeyfier)
+library(scales)
+library(tidyr)
+
+# --- Load data ---
+sig_summary <- read.csv(
+  "D:/Marco_backups/pipeline/single_results_random_fixed_last_new_filtered_signif_summary.csv",
+  stringsAsFactors = FALSE
+)
+
+# --- Predictor grouping ---
+sig_summary <- sig_summary %>%
+  mutate(
+    PredictorCombined = case_when(
+      grepl("^locomotion", Predictor, ignore.case = TRUE) ~ "locomotion",
+      grepl("^habitat", Predictor, ignore.case = TRUE) ~ "habitat",
+      grepl("^primary_diet", Predictor, ignore.case = TRUE) ~ "diet",
+     # Predictor == "weaning_age" ~ "weaning age",
+     # Predictor == "ln_body_mass_g" ~ "body size",
+      #Predictor == "ln_brain_mass_g" ~ "brain size",
+     #Predictor == "gestation_length" ~ "gestation length",
+      #Predictor == "typical lifespan" ~ "lifespan",
+      grepl("^ln_", Predictor, ignore.case = TRUE) ~ "biological scaling",
+      grepl("typical_lifespan|weaning_age|gestation_length", Predictor, ignore.case = TRUE) ~ "life history duration",
+      TRUE ~ Predictor
+    ),
+    PredictorCombined = tolower(trimws(PredictorCombined))
+  )
+
+# --- Response grouping ---
+sig_summary <- sig_summary %>%
+  mutate(
+    ResponseCombined = case_when(
+      Trait == "Antisphericity_res" ~ "antisphericity",
+      Trait == "Concavity_res" ~ "concavity",
+      Trait == "alpha_complexity_res" ~ "alpha complexity",
+      Trait == "FD_res" ~ "fractal dimensions",
+      Trait == "Rugosity_res" ~ "rugosity",
+      TRUE ~ Trait
+    ),
+    ResponseCombined = tolower(trimws(ResponseCombined))
+  )
+
+# --- Aggregate data ---
+agg_df <- sig_summary %>%
+  group_by(ResponseCombined, PredictorCombined) %>%
+  summarise(
+    mean_effect = mean(post.mean, na.rm = TRUE),
+    abs_effect  = mean(abs(post.mean), na.rm = TRUE),
+    n_models    = n(),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    intensity = rescale(abs_effect, to = c(0.3,0.9)),
+    link_color = case_when(
+      PredictorCombined %in% c("locomotion","habitat","diet") ~ alpha("#00CCCC", intensity),
+      mean_effect >= 0 ~ alpha("#6699FF", intensity),
+      mean_effect < 0  ~ alpha("#FF00FF", intensity),
+      TRUE ~ alpha("grey60", intensity)
+    )
+  )
+
+# --- Pivot to long format ---
+sankey_data <- pivot_stages_longer(
+  data = agg_df,
+  stages_from = c("ResponseCombined", "PredictorCombined"),
+  values_from = "n_models",
+  additional_aes_from = "link_color"
+)
+
+# --- Define vertical order ---
+response_order <- c(
+  "antisphericity",
+  "concavity",
+  "alpha complexity",
+  "fractal dimensions",
+  "rugosity"
+)
+ 
+predictor_order <- c(
+  "habitat",
+  "diet",
+  "locomotion",
+  #"gestation length",
+  #"weaning age",
+  #"lifespan"
+  "life history duration",
+  "biological scaling"
+)
+
+# --- Convert node to factor and sort for as_is ordering ---
+sankey_data <- sankey_data %>%
+  mutate(
+    node = case_when(
+      stage == "ResponseCombined" ~ factor(node, levels = response_order),
+      stage == "PredictorCombined" ~ factor(node, levels = predictor_order),
+      TRUE ~ node
+    )
+  ) %>%
+  arrange(stage, node)
+
+# --- Position object with as_is ordering ---
+pos <- position_sankey(v_space = 10, align = "justify", order = "as_is")
+
+# --- Plot ---
+p<-ggplot(sankey_data, aes(
+      x = stage,
+      y = n_models,
+      group = node,
+      connector = connector,
+      edge_id = edge_id,
+      node_id = node
+    )) +
+  geom_sankeyedge(aes(fill = link_color), position = pos, alpha = 1) +
+  geom_sankeynode(position = pos, fill = "grey85", color = "grey40") +
+  geom_text(
+    aes(label = node, hjust = after_stat(ifelse(connector=="from",-0.1,1.1))),
+    stat = "sankeynode",
+    position = pos,
+    size = 3
+  ) +
+  scale_fill_identity() +
+  scale_x_discrete(labels = c("Response","Predictor group"), expand = c(0.1,0.1)) +
+  labs(
+    title = "Specific Response → Predictor Group (ordered nodes)",
+    x = NULL,
+    y = "Number of models"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    panel.grid = element_blank(),
+    axis.text.y = element_blank(),
+    axis.ticks = element_blank(),
+    plot.title = element_text(face = "bold", hjust = 0.5)
+  )
+
+# --- Save as editable PDF ---
+ggsave(
+  "global_summary_Sankey_static_ggsankeyfier_last_new.pdf",
+  plot = p,
+  device = cairo_pdf,
+  width = 14,
+  height = 9
+)
+
+cat("✅ Static Sankey with vertical spacing and exact order saved as editable PDF\n")
+
+```
+
+>snippet 10: a helper to generate a PCA of suture mean values and extract PCA loadings
+
+```{r, 10) generate PCA plot}
+library(dplyr)
+library(ggplot2)
+library(ggrepel)
+
+# ================================
+# 1. Variable selection
+# ================================
+all_resp_vars <- c(
+   "Concavity_res", 
+  "Antisphericity_res", "FD_res", "Rugosity_res","alpha_complexity_res")
+
+all_resp_vars <- all_resp_vars[all_resp_vars %in% colnames(data)]
+
+size_vars <- c("HeightRange", "Planar", "centroid_size_mm", "actual_volume")
+
+resp_vars_nosize <- setdiff(all_resp_vars, size_vars)
+
+# Dataset 
+df_res <- data %>%
+  select(all_of(resp_vars_nosize), suture)
+
+
+
+# ================================
+# 4. PCA on residuals
+# ================================
+pca_res <- prcomp(df_res %>% select(all_of(resp_vars_nosize)),
+                  center = TRUE, scale. = FALSE)
+
+#pca_res$x[, "PC1"]    <- -pca_res$x[, "PC1"]
+#pca_res$rotation[, "PC1"] <- -pca_res$rotation[, "PC1"]
+
+pca_res$x[, "PC2"]    <- -pca_res$x[, "PC2"]
+pca_res$rotation[, "PC2"] <- -pca_res$rotation[, "PC2"]
+
+
+eigen_res <- pca_res$sdev^2
+prop_res  <- eigen_res / sum(eigen_res)
+
+
+
+
+suture_regions <- data.frame(
+  suture = c(
+    "coronal", "frontojugal", "frontomaxillary", "frontonasal",
+    "frontopremaxillary", "interfrontal", "internasal", "interpalatine",
+    "lambdoid", "maxillaryjugal", "maxillarypalatine", "maxillarypremaxillary",
+    "nasomaxillary", "nasopremaxillary", "occipital", "occipitoparietal",
+    "sagittal", "sphenofrontal", "squamosalparietal", "squamosooccipital",
+    "temporozygomatic"
+  ),
+  Region = c(
+    "Neurocranial", "Transitional", "Transitional", "Transitional",
+    "Transitional", "Neurocranial", "Viscerocranial", "Viscerocranial",
+    "Neurocranial", "Viscerocranial", "Viscerocranial", "Viscerocranial",
+    "Viscerocranial", "Viscerocranial", "Neurocranial", "Neurocranial",
+    "Neurocranial", "Neurocranial", "Neurocranial", "Neurocranial",
+    "Transitional"
+  )
+)
+# ================================
+# 5. Scores and suture means
+# ================================
+scores_res <- as.data.frame(pca_res$x) %>%
+  mutate(suture = df_res$suture)
+
+means_res <- scores_res %>%
+  group_by(suture) %>%
+  summarise(across(starts_with("PC"), mean))
+
+
+
+# Add Region information
+means_res <- means_res %>%
+  left_join(suture_regions, by = c("suture" = "suture"))
+
+
+# ================================
+# 6. Region convex hulls
+# ================================
+region_hulls_res <- means_res %>%
+  group_by(Region) %>%
+  slice(chull(PC1, PC2)) %>%
+  ungroup()
+
+
+# ================================
+# 7. Loadings (arrows)
+# ================================
+load_res <- as.data.frame(pca_res$rotation[,1:3])
+load_res$var <- rownames(load_res)
+
+
+mult_res <- 0.6 * min(
+  diff(range(means_res$PC1)) / diff(range(load_res$PC1)),
+  diff(range(means_res$PC2)) / diff(range(load_res$PC2))
+)
+
+load_res <- load_res %>%
+  mutate(arrow_x = PC1 * mult_res,
+         arrow_y = PC2 * mult_res)
+
+
+# ================================
+# 8. Plot PCA
+# ================================
+
+
+p_res <- 
+  pdf("PCA_sutures_last_new.pdf", width = 7, height = 5)
+  ggplot(means_res, aes(PC1, PC2)) +
+  geom_polygon(data = region_hulls_res,
+               aes(fill = Region, group = Region),
+               alpha = 0.25, color = NA) +
+  geom_point(aes(color = Region), size = 4, shape = 21, stroke = 0.4) +
+  geom_text_repel(aes(label = suture, color = Region),
+                  size = 4, fontface = "bold", show.legend = FALSE) +
+  geom_segment(data = load_res,
+               aes(x = 0, y = 0, xend = arrow_x, yend = arrow_y),
+               inherit.aes = FALSE,
+               arrow = arrow(length = unit(0.02, "npc"))) +
+  geom_text_repel(data = load_res,
+                  aes(x = arrow_x, y = arrow_y, label = var),
+                  inherit.aes = FALSE,
+                  size = 3) +
+  labs(
+    title = "PCA on Residuals (Regressed on Scaled Centroid Size)",
+    subtitle = "best_alpha, Convexity, Sphericity inverted; region-level convex hulls",
+    x = paste0("PC1 (", round(prop_res[1] * 100, 1), "%)"),
+    y = paste0("PC2 (", round(prop_res[2] * 100, 1), "%)")
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "right",
+    legend.title = element_text(face = "bold")
+  )
+
+dev.off()
+
+pca_res$rotation[,1:3]
+prop_res[1] * 100
+prop_res[2] * 100
+prop_res[3] * 100
+
+sapply(df_res[resp_vars_nosize], var)
+
+```
+
+>snippet 11: convergence testing on general model structure for the three types of models. Run only after models (or a sample of models) have been already run
+
+```{r, 11) general model structure convergence testing and disgnostics}
+
+#Intercept-only model
+
+library(coda)
+
+intercept_model<-readRDS("D:/Marco_backups/pipeline/Intercept_only_MRPMM_scaled_last.rds")
+par(mfrow=c(2,2), mar=c(2,2,1,0))
+plot(intercept_model$Sol, auto.layout=F)
+
+par(mfrow=c(2,2), mar=c(2,2,1,2))
+gelman.plot(m6, auto.layout=F)
+
+gelman.diag(m6, multivariate=T)
+
+par(mfrow=c(2,2), mar=c(2, 1, 1, 1))
+plot(m6, ask=F, auto.layout=F)
+
+
+
+#general structure, models with suture as fixed effect
+
+get_predictor_combinations <- function(predictors, max_terms = 3) {
+  combos <- list()
+  for (i in 1:max_terms) {
+    combos <- c(combos, combn(predictors, i, simplify = FALSE))
+  }
+  return(combos)
+}
+ 
+max_terms = 3
+df <- data
+  df$animal <- df$species  # phylogenetic grouping factor
+  
+  # Prior for univariate model: residual + phylo variance + suture variance
+    prior_uni <- list(
+    R = list(V = 1, nu = 0.002),
+    G = list(G1 = list(V = 1, nu = 0.002))
+  )
+
+ predictor_sets <- get_predictor_combinations(predictors, max_terms = max_predictors)
+
+  
+   df_trait <- df[complete.cases(df[, c(trait, predictors, "suture")]), ]
+  
+  pred_str <- paste(pred_set, collapse = " + ")
+      fixed_formula <- as.formula(paste(trait, "~", pred_str))  
+  
+
+fixed_sut <- mclapply(1:4, function(i){MCMCglmm(
+          fixed = fixed_formula,
+          random = ~ animal,          # phylogenetic effect
+          rcov   = ~ units,           # residual
+          family = "gaussian",
+          pedigree = nu_tree,
+          data = df,
+          prior = prior_uni,
+          nitt = 80000, burnin = 20000, thin = 100,
+          verbose = FALSE)
+        })
+
+fixed_sut <- lapply(fixed_sut, function(m) m$Sol)
+fixed_sut <- do.call(mcmc.list, fixed_sut)
+
+library(coda)
+
+par(mfrow=c(2,2), mar=c(2,2,1,2))
+gelman.plot(fixed_sut, auto.layout=F)
+
+gelman.diag(fixed_sut, multivariate=T)
+
+par(mfrow=c(2,2), mar=c(2, 1, 1, 1))
+plot(fixed_sut, ask=F, auto.layout=F)
+
+
+#general structure, models with suture as random effect - because testing is at the suture level, we get convergence but narrow priors-> requires model-by-model diagnostics
+get_predictor_combinations <- function(predictors, max_terms = 3) {
+  combos <- list()
+  for (i in 1:max_terms) {
+    combos <- c(combos, combn(predictors, i, simplify = FALSE))
+  }
+  return(combos)
+}
+ 
+max_terms = 3
+df <- data
+  df$animal <- df$species  # phylogenetic grouping factor
+  
+  # Prior for univariate model: residual + phylo variance + suture variance
+  prior_uni <- list(
+    R = list(V = 1, nu = 0.002),
+    G = list(
+      G1 = list(V = 1, nu = 0.002),  # phylogeny
+      G2 = list(V = 1, nu = 0.002)   # suture
+    )
+  )
+
+ predictor_sets <- get_predictor_combinations(predictors, max_terms = max_predictors)
+
+  
+   df_trait <- df[complete.cases(df[, c(trait, predictors, "suture")]), ]
+  
+  pred_str <- paste(pred_set, collapse = " + ")
+      fixed_formula <- as.formula(paste(trait, "~", pred_str))  
+  
+random_sut <- mclapply(1:4, function(i){ model <- MCMCglmm(
+          fixed    = fixed_formula,
+          random   = ~ animal + suture,   # ✅ phylogeny + suture
+          rcov     = ~ units,
+          family   = "gaussian",
+          pedigree = nu_tree,
+          data     = df_trait,
+          prior    = prior_uni,
+          nitt     = 80000, burnin = 20000, thin = 100,
+          verbose  = FALSE)
+        })
+
+random_sut <- lapply(random_sut, function(m) m$Sol)
+random_sut <- do.call(mcmc.list, random_sut)
+
+library(coda)
+
+par(mfrow=c(2,2), mar=c(2,2,1,2))
+gelman.plot(random_sut, auto.layout=F)
+
+gelman.diag(random_sut, multivariate=T)
+
+par(mfrow=c(2,2), mar=c(2, 1, 1, 1))
+plot(random_sut, ask=F, auto.layout=F)
+
+```
+
+>snippet 12: convergence testing on the final model design (single-responses, with sutures as a random effect). Run only after models (or a sample of models) have been already run, so that the data is already loaded in your environment. To save processing time, the process currently runs based on the best models with significant effects.
+
+```{r, 12) convergence testing and diagnostics for individual model suitability (the most supported)}
+
+#analysis done only on single-response models, with suture as a random effect, that display significant effects, and are within 5 DIC values from the best model for a given response variable
+
+# ============================================================
+# RUN SELECTED MODELS FROM CSV WITH 2 CHAINS + GELMAN-RUBIN
+# ============================================================
+
+library(MCMCglmm)
+library(coda)
+
+# ------------------------------------------------------------
+# 1. PRIOR
+# ------------------------------------------------------------
+prior_uni <- list(
+  R = list(V = 1, nu = 0.002),
+  G = list(
+    G1 = list(V = 1, nu = 0.002),
+    G2 = list(V = 1, nu = 0.002)
+  )
+)
+
+# ------------------------------------------------------------
+# 2. READ CSV + REMOVE DUPLICATES
+# ------------------------------------------------------------
+df_models <- read.csv("D:/Marco_backups/pipeline/single_results_random_fixed_last_new_filtered_signif_summary.csv", stringsAsFactors = FALSE)
+df_models <- unique(df_models[, c("Trait", "Predictors_set")])
+
+# ------------------------------------------------------------
+# 3. BUILD FORMULA FUNCTION
+# ------------------------------------------------------------
+build_formula <- function(trait, predictors_string) {
+  preds <- unlist(strsplit(predictors_string, ","))
+  preds <- trimws(preds)
+  as.formula(paste(trait, "~", paste(preds, collapse = " + ")))
+}
+
+# ------------------------------------------------------------
+# 4. RUN MODELS (2 CHAINS EACH)
+# ------------------------------------------------------------
+results <- list()
+
+for (i in seq_len(nrow(df_models))) {
+  
+  trait <- df_models$Trait[i]
+  preds <- df_models$Predictors_set[i]
+  
+  f <- build_formula(trait, preds)
+  name <- paste(trait, preds, sep = "_")
+  
+  cat("\n=============================================\n")
+  cat("Running:", name, "\nFormula:", deparse(f), "\n")
+  cat("=============================================\n")
+  
+  # subset data
+  vars <- all.vars(f)
+  df_sub <- data[complete.cases(data[, vars]), ]
+  
+  # ---------------------------
+  # RUN TWO CHAINS
+  # ---------------------------
+  
+  model1 <- MCMCglmm(
+    fixed = f,
+    random = ~ animal + suture,
+    rcov = ~ units,
+    family = "gaussian",
+    pedigree = nu_tree,
+    data = df_sub,
+    prior = prior_uni,
+    nitt = 80000, burnin = 20000, thin = 100,
+    verbose = FALSE
+  )
+  
+  model2 <- MCMCglmm(
+    fixed = f,
+    random = ~ animal + suture,
+    rcov = ~ units,
+    family = "gaussian",
+    pedigree = nu_tree,
+    data = df_sub,
+    prior = prior_uni,
+    nitt = 80000, burnin = 20000, thin = 100,
+    verbose = FALSE
+  )
+  
+  # ---------------------------
+  # COMBINE CHAINS
+  # ---------------------------
+  
+  chains <- mcmc.list(model1$Sol, model2$Sol)
+  
+  # ---------------------------
+  # GELMAN-RUBIN
+  # ---------------------------
+  
+  gr <- gelman.diag(chains, multivariate = FALSE)
+  converged <- all(gr$psrf[,1] < 1.1)
+  
+  # ---------------------------
+  # STORE RESULTS
+  # ---------------------------
+  
+  results[[name]] <- list(
+    formula = f,
+    model_chain1 = model1,
+    model_chain2 = model2,
+    DIC = mean(c(model1$DIC, model2$DIC)),
+    gelman_rubin = gr,
+    converged = converged
+  )
+  
+  cat("Finished:", name,
+      "| mean DIC =", round(results[[name]]$DIC, 2),
+      "| converged =", converged, "\n")
+  
+  # optional save per model
+  # saveRDS(results[[name]], file = paste0("models/", name, ".rds"))
+}
+
+# ------------------------------------------------------------
+# 5. LIST NON-CONVERGED MODELS
+# ------------------------------------------------------------
+bad_models <- names(results)[!sapply(results, function(x) x$converged)]
+
+cat("\n=============================\n")
+cat("Non-converged models:\n")
+print(bad_models)
+cat("=============================\n")
+
+
+summary_list <- list()
+
+for (name in names(results)) {
+  
+  gr <- results[[name]]$gelman_rubin$psrf
+  
+  df <- data.frame(
+    model = name,
+    parameter = rownames(gr),
+    Rhat = gr[,1],
+    upper_CI = gr[,2],
+    converged = gr[,1] < 1.1
+  )
+  
+  summary_list[[name]] <- df
+}
+
+summary_df <- do.call(rbind, summary_list)
+
+write.csv(summary_df, "D:/Marco_backups/pipeline/gelman_rubin_summary.csv", row.names = FALSE)
+
+model_summary <- data.frame(
+  model = names(results),
+  max_Rhat = sapply(results, function(x) max(x$gelman_rubin$psrf[,1])),
+  mean_Rhat = sapply(results, function(x) mean(x$gelman_rubin$psrf[,1])),
+  converged = sapply(results, function(x) all(x$gelman_rubin$psrf[,1] < 1.1)),
+  DIC = sapply(results, function(x) x$DIC)
+)
+
+write.csv(model_summary, "D:/Marco_backups/pipeline/model_level_summary.csv", row.names = FALSE)
+
+out_dir <- "D:/Marco_backups/pipeline/gelman_plots/"
+
+if (!dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE)
+
+for (name in names(results)) {
+  
+  # clean filename (important if names contain special characters)
+  safe_name <- gsub("[^A-Za-z0-9_]", "_", name)
+  
+  file_path <- file.path(out_dir, paste0("gelman_", safe_name, ".pdf"))
+  
+  pdf(file_path, width = 6, height = 6)
+  
+  chains <- mcmc.list(
+    results[[name]]$model_chain1$Sol,
+    results[[name]]$model_chain2$Sol
+  )
+  
+  gelman.plot(chains)
+  title(main = name)
+  
+  dev.off()
+}
+
+library(coda)
+
+diag_summary <- data.frame(
+  model = names(results),
+  multivariate_psrf = vapply(results, function(x) {
+    
+    chains <- mcmc.list(
+      x$model_chain1$Sol,
+      x$model_chain2$Sol
+    )
+    
+    gr <- gelman.diag(chains, multivariate = TRUE)
+    
+    val <- gr$mpsrf
+    if (is.null(val) || length(val) == 0) NA else val
+    
+  }, numeric(1))
+)
+
+write.csv(diag_summary, "D:/Marco_backups/pipeline/gelman_multivariate.csv", row.names = FALSE)
+
+out_dir <- "D:/Marco_backups/trace_plots/"
+if (!dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE)
+
+library(coda)
+
+for (name in names(results)) {
+  
+  safe_name <- gsub("[^A-Za-z0-9_]", "_", name)
+  file_path <- file.path(out_dir, paste0("trace_", safe_name, ".pdf"))
+  
+  pdf(file_path, width = 14, height = 8)
+  
+  # combine both chains
+  chains <- mcmc.list(
+    results[[name]]$model_chain1$Sol,
+    results[[name]]$model_chain2$Sol
+  )
+  
+  par(mfrow = c(2,2), mar = c(2, 1, 2, 1))
+  plot(chains, ask = FALSE, auto.layout = FALSE)
+  title(main = name)
+  
+  dev.off()
+}
+
+```
+
