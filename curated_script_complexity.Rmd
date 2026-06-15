@@ -1,0 +1,237 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+This is an [R Markdown](http://rmarkdown.rstudio.com) Notebook. When you execute code within the notebook, the results appear beneath the code. 
+
+Try executing this chunk by clicking the *Run* button within the chunk or by placing your cursor inside it and pressing *Ctrl+Shift+Enter*. 
+
+```{r, calculate complexity metrics}
+
+library(Rvcg)
+library(habtools)
+
+# === Paths ===
+mesh_folder <- "C:/" #insert path to your mesh folder
+ply_files <- list.files(mesh_folder, pattern = "\\.ply$", full.names = TRUE)
+z
+# === Setup containers ===
+metrics_list <- list()
+log_list <- list()
+
+# === Wrapper to safely compute each metric ===
+safe_metric <- function(fn, mesh) {
+  tryCatch(fn(mesh), error = function(e) NA)
+}
+
+# === Function to process one mesh ===
+process_mesh <- function(path) {
+  fname <- basename(path)
+  cat("Processing:", fname, "\n")
+
+  mesh <- tryCatch({
+    vcgImport(path, readcolor = FALSE)
+  }, error = function(e) {
+    log_list[[fname]] <<- paste("❌ Import failed:", e$message)
+    return(NULL)
+  })
+  if (is.null(mesh)) return(NULL)
+
+ #  === Run metrics ===
+  metrics <- list(
+    Convexity   = safe_metric(habtools::convexity, mesh),
+    Rugosity    = safe_metric(habtools::rg, mesh),
+    Sphericity = safe_metric(habtools::sphericity, mesh),
+    FD          = safe_metric(habtools::fd, mesh)
+  )
+  log_list[[fname]] <<- paste("✅ Metrics calculated (v =", ncol(mesh$vb), ")")
+  return(metrics)
+}
+
+# === Progress bar ===
+pb <- txtProgressBar(min = 0, max = length(ply_files), style = 3)
+
+for (i in seq_along(ply_files)) {
+  f <- ply_files[i]
+  name <- tools::file_path_sans_ext(basename(f))
+  metrics <- process_mesh(f)
+
+  if (!is.null(metrics)) {
+    metrics_list[[name]] <- metrics
+  }
+
+  setTxtProgressBar(pb, i)
+}
+close(pb)
+
+# === Save results ===
+if (length(metrics_list) > 0) {
+  df <- do.call(rbind, lapply(metrics_list, function(x) as.data.frame(t(unlist(x)))))
+  rownames(df) <- names(metrics_list)
+
+  out_csv <- file.path(mesh_folder, "complexity_metrics.csv")
+  write.csv(df, out_csv, row.names = TRUE)
+  message("✅ Metrics saved to: ", out_csv)
+} else {
+  message("⚠️ No valid meshes processed.")
+}
+
+# === Save logs ===
+log_path <- file.path(mesh_folder, "complexity_metrics.txt")
+writeLines(paste(names(log_list), ":", unlist(log_list)), con = log_path)
+message("📄 Logs saved to: ", log_path)
+
+
+```
+
+
+```{r, diagnostic check for FD between pre-clean and poisson meshes}
+# =========================
+# Load libraries
+# =========================
+library(dplyr)
+library(ggplot2)
+
+# =========================
+# Load data
+# ========================
+df_pre  <- read.csv("E:/Marco_backups/suture_gen/matched_rescaled/single_element/complexity_metrics_new.csv")
+df_post <- read.csv("C:/Users/goswamilab/Desktop/Suppl_Mat/data/complete_recast_metrics.csv")
+
+# =========================
+# Rename FD columns (adjust if needed)
+# =========================
+# Assume columns are named: filename, FD
+df_pre  <- df_pre  %>% rename(FD_pre = FD)
+df_post <- df_post %>% rename(FD_post = FD)
+
+# =========================
+# Merge by filename
+# =========================
+df <- inner_join(df_pre, df_post, by = "filename")
+
+# =========================
+# Remove NA safely
+# =========================
+df <- df %>% filter(!is.na(FD_pre), !is.na(FD_post))
+
+# =========================
+# Correlation analysis
+# =========================
+pearson_r  <- cor(df$FD_pre, df$FD_post, method = "pearson")
+spearman_r <- cor(df$FD_pre, df$FD_post, method = "spearman")
+
+cat("Pearson r:", pearson_r, "\n")
+cat("Spearman r:", spearman_r, "\n")
+
+# =========================
+# Linear regression
+# =========================
+model <- lm(FD_post ~ FD_pre, data = df)
+summary(model)
+
+# =========================
+# Plot: scatter + regression line
+# =========================
+ggplot(df, aes(x = FD_pre, y = FD_post)) +
+  geom_point(size = 2, alpha = 0.7) +
+  geom_smooth(method = "lm", color = "blue") +
+  theme_minimal() +
+  labs(
+    title = "FD: Pre vs Post Poisson",
+    x = "FD (Pre-Poisson)",
+    y = "FD (Post-Poisson)"
+  )
+
+# =========================
+# Residual diagnostics
+# =========================
+par(mfrow = c(2, 2))
+plot(model)
+
+# =========================
+# Differences summary
+# =========================
+df <- df %>% mutate(diff = FD_post - FD_pre)
+
+cat("\nMean difference:", mean(df$diff), "\n")
+cat("SD difference:", sd(df$diff), "\n")
+cat("Max abs difference:", max(abs(df$diff)), "\n")
+```
+
+
+```{r, diagnostic check for Rugosity between pre-clean and poisson meshes}
+# =========================
+# Load libraries
+# =========================
+library(dplyr)
+library(ggplot2)
+
+# =========================
+# Load data
+# ========================
+df_pre  <- read.csv("E:/Marco_backups/suture_gen/matched_rescaled/single_element/complexity_metrics_new.csv")
+df_post <- read.csv("C:/Users/goswamilab/Desktop/Suppl_Mat/data/complete_recast_metrics.csv")
+
+# =========================
+# Rename Rugosity columns (adjust if needed)
+# =========================
+# Assume columns are named: filename, Rugosity
+df_pre  <- df_pre  %>% rename(Rugosity_pre = Rugosity)
+df_post <- df_post %>% rename(Rugosity_post = Rugosity)
+
+# =========================
+# Merge by filename
+# =========================
+df <- inner_join(df_pre, df_post, by = "filename")
+
+# =========================
+# Remove NA safely
+# =========================
+df <- df %>% filter(!is.na(Rugosity_pre), !is.na(Rugosity_post))
+
+# =========================
+# Correlation analysis
+# =========================
+pearson_r  <- cor(df$Rugosity_pre, df$Rugosity_post, method = "pearson")
+spearman_r <- cor(df$Rugosity_pre, df$Rugosity_post, method = "spearman")
+
+cat("Pearson r:", pearson_r, "\n")
+cat("Spearman r:", spearman_r, "\n")
+
+# =========================
+# Linear regression
+# =========================
+model <- lm(Rugosity_post ~ Rugosity_pre, data = df)
+summary(model)
+
+# =========================
+# Plot: scatter + regression line
+# =========================
+ggplot(df, aes(x = Rugosity_pre, y = Rugosity_post)) +
+  geom_point(size = 2, alpha = 0.7) +
+  geom_smooth(method = "lm", color = "blue") +
+  theme_minimal() +
+  labs(
+    title = "Rugosity: Pre vs Post Poisson",
+    x = "Rugosity (Pre-Poisson)",
+    y = "Rugosity (Post-Poisson)"
+  )
+
+# =========================
+# Residual diagnostics
+# =========================
+par(mfrow = c(2, 2))
+plot(model)
+
+# =========================
+# Differences summary
+# =========================
+df <- df %>% mutate(diff = Rugosity_post - Rugosity_pre)
+
+cat("\nMean difference:", mean(df$diff), "\n")
+cat("SD difference:", sd(df$diff), "\n")
+cat("Max abs difference:", max(abs(df$diff)), "\n")
+```
+
