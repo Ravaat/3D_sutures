@@ -5,6 +5,8 @@ import pymeshlab
 import csv
 import numpy as np
 
+#this part of the pipeline exists only as a check of mesh integrity, to assess if mesh normals need to be inverted (if so, it performs the operation automatically)
+
 input_dir = os.path.abspath("E:/Marco_backups/suture_gen/matched_rescaled")
 output_dir = os.path.abspath("E:/Marco_backups/suture_gen/matched_rescaled/single_element")
 
