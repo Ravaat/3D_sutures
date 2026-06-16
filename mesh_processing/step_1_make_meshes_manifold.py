@@ -5,8 +5,8 @@ import pymeshlab
 import csv
 import numpy as np
 
-input_dir = os.path.abspath("C:/Users/goswamilab/Downloads/Centroscymnus_coelolepis_denticles_STL/processed/plyd/")
-output_dir = os.path.abspath("C:/Users/goswamilab/Downloads/Centroscymnus_coelolepis_denticles_STL/processed/")
+input_dir = os.path.abspath("C:/Users/goswamilab/Downloads/Centroscymnus_coelolepis_denticles_STL/processed/plyd/") #directory where your unprocessed meshes are located
+output_dir = os.path.abspath("C:/Users/goswamilab/Downloads/Centroscymnus_coelolepis_denticles_STL/processed/") #output directory
 
 if input_dir == output_dir:
     print("Error: input_dir and output_dir are the same. You will overwrite your lovely scans! Choose again.")
