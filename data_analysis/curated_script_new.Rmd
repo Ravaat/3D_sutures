@@ -1174,7 +1174,7 @@ head(combined_df)
 # Summarize existing models without refitting
 # ============================================================
 
-fixed_sutures<-readRDS("D:/Marco_backups/pipeline/SR_suturefixed_last.RDS")
+fixed_sutures<-readRDS("D:/Marco_backups/pipeline/SR_suturefixed_last.RDS") #use the RDS file containing your models
 
 if (!is.null(fixed_sutures)) { #'single_result_fixed' is a dummy object. Substitute every instance with name of a model results object
   
@@ -1220,7 +1220,7 @@ if (!is.null(fixed_sutures)) { #'single_result_fixed' is a dummy object. Substit
 
 ```{r, 7) helper for top model selection}
 # Load model summary spreadsheet
-df <- read.csv("D:/Marco_backups/pipeline/fixed_sutures.csv", stringsAsFactors = FALSE)
+df <- read.csv("D:/Marco_backups/pipeline/fixed_sutures.csv", stringsAsFactors = FALSE) #use the csv output from the previous snippet to parse the top models
 
 # Ensure DIC is numeric
 df$DIC <- as.numeric(df$DIC)
@@ -1267,7 +1267,7 @@ library(tidyr)
 # ------------------------------------------------------------
 # 1. Load model
 # ------------------------------------------------------------
-model_path <- "D:/Marco_backups/pipeline/SR_random_fixed_individual_last.RDS"
+model_path <- "D:/Marco_backups/pipeline/SR_random_fixed_individual_last.RDS" #use the RDS file containing your models
 model <- readRDS(model_path)
 
 alpha_names <- names(model)
@@ -1446,9 +1446,9 @@ library(ggsankeyfier)
 library(scales)
 library(tidyr)
 
-# --- Load data ---
+# --- Load data --- use the significance csv summary from the selection helper output
 sig_summary <- read.csv(
-  "D:/Marco_backups/pipeline/single_results_random_fixed_last_new_filtered_signif_summary.csv",
+  "D:/Marco_backups/pipeline/single_results_random_fixed_last_new_filtered_signif_summary.csv", 
   stringsAsFactors = FALSE
 )
 
@@ -1750,7 +1750,7 @@ sapply(df_res[resp_vars_nosize], var)
 
 library(coda)
 
-intercept_model<-readRDS("D:/Marco_backups/pipeline/Intercept_only_MRPMM_scaled_last.rds")
+intercept_model<-readRDS("D:/Marco_backups/pipeline/Intercept_only_MRPMM_scaled_last.rds")  #read results from the intercept-only model
 par(mfrow=c(2,2), mar=c(2,2,1,0))
 plot(intercept_model$Sol, auto.layout=F)
 
@@ -1903,7 +1903,7 @@ prior_uni <- list(
 # ------------------------------------------------------------
 # 2. READ CSV + REMOVE DUPLICATES
 # ------------------------------------------------------------
-df_models <- read.csv("D:/Marco_backups/pipeline/single_results_random_fixed_last_new_filtered_signif_summary.csv", stringsAsFactors = FALSE)
+df_models <- read.csv("D:/Marco_backups/pipeline/single_results_random_fixed_last_new_filtered_signif_summary.csv", stringsAsFactors = FALSE) #use csv with significant effects summaries for the best models
 df_models <- unique(df_models[, c("Trait", "Predictors_set")])
 
 # ------------------------------------------------------------
