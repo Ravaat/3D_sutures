@@ -1742,7 +1742,7 @@ sapply(df_res[resp_vars_nosize], var)
 
 ```
 
->snippet 11: convergence testing on general model structure for the three types of models. Run only after models (or a sample of models) have been already run
+>snippet 11: convergence testing on general model structure for the intercept-only model. Run only after model (or a sample of models) has been already run
 
 ```{r, 11) general model structure convergence testing and disgnostics}
 
@@ -1753,126 +1753,6 @@ library(coda)
 intercept_model<-readRDS("D:/Marco_backups/pipeline/Intercept_only_MRPMM_scaled_last.rds")  #read results from the intercept-only model
 par(mfrow=c(2,2), mar=c(2,2,1,0))
 plot(intercept_model$Sol, auto.layout=F)
-
-par(mfrow=c(2,2), mar=c(2,2,1,2))
-gelman.plot(m6, auto.layout=F)
-
-gelman.diag(m6, multivariate=T)
-
-par(mfrow=c(2,2), mar=c(2, 1, 1, 1))
-plot(m6, ask=F, auto.layout=F)
-
-
-
-#general structure, models with suture as fixed effect
-
-get_predictor_combinations <- function(predictors, max_terms = 3) {
-  combos <- list()
-  for (i in 1:max_terms) {
-    combos <- c(combos, combn(predictors, i, simplify = FALSE))
-  }
-  return(combos)
-}
- 
-max_terms = 3
-df <- data
-  df$animal <- df$species  # phylogenetic grouping factor
-  
-  # Prior for univariate model: residual + phylo variance + suture variance
-    prior_uni <- list(
-    R = list(V = 1, nu = 0.002),
-    G = list(G1 = list(V = 1, nu = 0.002))
-  )
-
- predictor_sets <- get_predictor_combinations(predictors, max_terms = max_predictors)
-
-  
-   df_trait <- df[complete.cases(df[, c(trait, predictors, "suture")]), ]
-  
-  pred_str <- paste(pred_set, collapse = " + ")
-      fixed_formula <- as.formula(paste(trait, "~", pred_str))  
-  
-
-fixed_sut <- mclapply(1:4, function(i){MCMCglmm(
-          fixed = fixed_formula,
-          random = ~ animal,          # phylogenetic effect
-          rcov   = ~ units,           # residual
-          family = "gaussian",
-          pedigree = nu_tree,
-          data = df,
-          prior = prior_uni,
-          nitt = 80000, burnin = 20000, thin = 100,
-          verbose = FALSE)
-        })
-
-fixed_sut <- lapply(fixed_sut, function(m) m$Sol)
-fixed_sut <- do.call(mcmc.list, fixed_sut)
-
-library(coda)
-
-par(mfrow=c(2,2), mar=c(2,2,1,2))
-gelman.plot(fixed_sut, auto.layout=F)
-
-gelman.diag(fixed_sut, multivariate=T)
-
-par(mfrow=c(2,2), mar=c(2, 1, 1, 1))
-plot(fixed_sut, ask=F, auto.layout=F)
-
-
-#general structure, models with suture as random effect - because testing is at the suture level, we get convergence but narrow priors-> requires model-by-model diagnostics
-get_predictor_combinations <- function(predictors, max_terms = 3) {
-  combos <- list()
-  for (i in 1:max_terms) {
-    combos <- c(combos, combn(predictors, i, simplify = FALSE))
-  }
-  return(combos)
-}
- 
-max_terms = 3
-df <- data
-  df$animal <- df$species  # phylogenetic grouping factor
-  
-  # Prior for univariate model: residual + phylo variance + suture variance
-  prior_uni <- list(
-    R = list(V = 1, nu = 0.002),
-    G = list(
-      G1 = list(V = 1, nu = 0.002),  # phylogeny
-      G2 = list(V = 1, nu = 0.002)   # suture
-    )
-  )
-
- predictor_sets <- get_predictor_combinations(predictors, max_terms = max_predictors)
-
-  
-   df_trait <- df[complete.cases(df[, c(trait, predictors, "suture")]), ]
-  
-  pred_str <- paste(pred_set, collapse = " + ")
-      fixed_formula <- as.formula(paste(trait, "~", pred_str))  
-  
-random_sut <- mclapply(1:4, function(i){ model <- MCMCglmm(
-          fixed    = fixed_formula,
-          random   = ~ animal + suture,   # ✅ phylogeny + suture
-          rcov     = ~ units,
-          family   = "gaussian",
-          pedigree = nu_tree,
-          data     = df_trait,
-          prior    = prior_uni,
-          nitt     = 80000, burnin = 20000, thin = 100,
-          verbose  = FALSE)
-        })
-
-random_sut <- lapply(random_sut, function(m) m$Sol)
-random_sut <- do.call(mcmc.list, random_sut)
-
-library(coda)
-
-par(mfrow=c(2,2), mar=c(2,2,1,2))
-gelman.plot(random_sut, auto.layout=F)
-
-gelman.diag(random_sut, multivariate=T)
-
-par(mfrow=c(2,2), mar=c(2, 1, 1, 1))
-plot(random_sut, ask=F, auto.layout=F)
 
 ```
 
