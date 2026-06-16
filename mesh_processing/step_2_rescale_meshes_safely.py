@@ -18,7 +18,7 @@ os.makedirs(output_dir, exist_ok=True)
 
 # Load voxel size CSV
 # expected columns: species, x, y, z   (or change names below if different)
-voxel_csv_path = "E:/Marco_backups/pipeline/cleaned_twice/voxres.csv"
+voxel_csv_path = "E:/Marco_backups/pipeline/cleaned_twice/voxres.csv"  #path to the csv with the voxel size information to correctly rescale your meshes
 voxel_df = pd.read_csv(voxel_csv_path)
 
 def get_voxel_sizes_for_species(species_name):
