@@ -1,4 +1,4 @@
-This is a pipeline for the calculation and analysis of the complexity of 3D cranial sutures in a mammal dataset. The three subsections are to be applied in this order:
+This is a pipeline for the calculation and analysis of the complexity of 3D cranial sutures in a mammal dataset. The pipeline is divided in three subsections, which are to be run in this order:
 
 1>the "mesh_processing" steps are for creating, cleaning, and preparing meshes for the extraction of complexity metrics
 
