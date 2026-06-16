@@ -6,9 +6,9 @@ import numpy as np
 import pandas as pd
 
 # Directories
-#input_dir = os.path.abspath("D:/Marco_backups/suture_gen/batch_4_cleaned")
-input_dir = os.path.abspath("E:/Marco_backups/suture_gen/matched")
-output_dir = os.path.abspath("E:/Marco_backups/suture_gen/matched_rescaled")
+
+input_dir = os.path.abspath("E:/Marco_backups/suture_gen/matched") #directory where your unscaled meshes are located
+output_dir = os.path.abspath("E:/Marco_backups/suture_gen/matched_rescaled") #output directory where your rescaled meshes will be found
 
 if input_dir == output_dir:
     print("Error: input_dir and output_dir are the same. You will overwrite your scans! Choose again.")
