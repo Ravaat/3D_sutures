@@ -1742,7 +1742,7 @@ sapply(df_res[resp_vars_nosize], var)
 
 ```
 
->snippet 11: convergence testing on general model structure for the intercept-only model. Run only after model (or a sample of models) has been already run
+>snippet 11: posterior-exploration testing on general model structure for the intercept-only model. Run only after model has been already run
 
 ```{r, 11) general model structure convergence testing and disgnostics}
 
@@ -1759,6 +1759,7 @@ plot(intercept_model$Sol, auto.layout=F)
 >snippet 12: convergence testing on the final model design (single-responses, with sutures as a random effect). Run only after models (or a sample of models) have been already run, so that the data is already loaded in your environment. To save processing time, the process currently runs based on the best models with significant effects.
 
 ```{r, 12) convergence testing and diagnostics for individual model suitability (the most supported)}
+
 
 #analysis done only on single-response models, with suture as a random effect, that display significant effects, and are within 5 DIC values from the best model for a given response variable
 
@@ -1783,7 +1784,7 @@ prior_uni <- list(
 # ------------------------------------------------------------
 # 2. READ CSV + REMOVE DUPLICATES
 # ------------------------------------------------------------
-df_models <- read.csv("D:/Marco_backups/pipeline/single_results_random_fixed_last_new_filtered_signif_summary.csv", stringsAsFactors = FALSE) #use csv with significant effects summaries for the best models
+df_models <- read.csv("D:/Marco_backups/pipeline/single_results_random_fixed_last_new_filtered_signif_summary.csv", stringsAsFactors = FALSE)
 df_models <- unique(df_models[, c("Trait", "Predictors_set")])
 
 # ------------------------------------------------------------
@@ -1951,8 +1952,8 @@ diag_summary <- data.frame(
   multivariate_psrf = vapply(results, function(x) {
     
     chains <- mcmc.list(
-      x$model_chain1$Sol,
-      x$model_chain2$Sol
+      cbind(x$model_chain1$Sol, x$model_chain1$VCV),
+      cbind(x$model_chain2$Sol, x$model_chain2$VCV)
     )
     
     gr <- gelman.diag(chains, multivariate = TRUE)
@@ -1963,7 +1964,7 @@ diag_summary <- data.frame(
   }, numeric(1))
 )
 
-write.csv(diag_summary, "D:/Marco_backups/pipeline/gelman_multivariate.csv", row.names = FALSE)
+write.csv(diag_summary, "D:/Marco_backups/pipeline/gelman_multivariate_2.csv", row.names = FALSE)
 
 out_dir <- "D:/Marco_backups/trace_plots/"
 if (!dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE)
@@ -1989,6 +1990,7 @@ for (name in names(results)) {
   
   dev.off()
 }
+
 
 ```
 
