@@ -2471,7 +2471,7 @@ for(resp in names(rung2)){
 }
 ```
 
->snippet 9: helper for testing relationships (autocorrelation) among predictors
+>snippet 10: helper for testing relationships (autocorrelation) among predictors
 
 ```{r, 10) testing relationships among predictors}
 
